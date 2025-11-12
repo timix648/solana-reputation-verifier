@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>On-Chain Identity & Reputation Verifier</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        #status-message {
+            min-height: 40px;
+            transition: all 0.3s;
+        }
+
+        .pulse {
+            animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+        }
+
+        @keyframes pulse {
+
+            0%,
+            100% {
+                opacity: 1;
+            }
+
+            50% {
+                opacity: .5;
+            }
+        }
+    </style>
+
+    <script>
+
+        function robustParseEther(amount) {
+            const [int, dec] = amount.split('.');
+            const exponent = 18;
+            let value = BigInt(int || 0) * BigInt(10) ** BigInt(exponent);
+
+            if (dec) {
+                const decValue = BigInt(dec);
+                const decLength = dec.length;
+                const padding = exponent - decLength;
+
+                if (padding >= 0) {
+                    value += decValue * BigInt(10) ** BigInt(padding);
+                }
+            }
+            return value.toString();
+        }
+
+        function wrapFetchWithPayment(originalFetch, account) {
+            return async (url, init = {}) => {
+                console.log('[Payment Fetch] Making request to:', url);
+                let response = await originalFetch(url, init);
+
+                // Payment loop - handles 402 responses
+                let retryCount = 0;
+                const maxRetries = 3;
+
+                while (response.status === 402 && retryCount < maxRetries) {
+                    retryCount++;
+                    console.log(`[Payment Fetch] 402 detected, attempt ${retryCount}/${maxRetries}`);
+
+                    // Get payment challenge from header
+                    const challengeHeader = response.headers.get('x-payment-required');
+
+                    console.log('[Payment Fetch] Challenge header:', challengeHeader);
+
+                    if (!challengeHeader) {
+                        console.error('[Payment Fetch] Missing x-payment-required header');
+                        // Try to get challenge from response body (fallback)
+                        try {
+                            const responseClone = response.clone();
+                            const body = await responseClone.text();
+                            console.log('[Payment Fetch] Response body:', body);
+                        } catch (e) {
+                            console.error('[Payment Fetch] Could not read response body:', e);
+                        }
+                        displayError("Payment failed: Server did not send payment details.", document.getElementById('status-message'));
+                        break;
+                    }
+
+                    let challenge;
+                    try {
+                        challenge = JSON.parse(challengeHeader);
+                        console.log('[Payment Fetch] Payment challenge:', challenge);
+                    } catch (e) {
+                        console.error('[Payment Fetch] Failed to parse challenge:', e);
+                        displayError("Payment failed: Invalid payment details from server.", document.getElementById('status-message'));
+                        break;
+                    }
+
+                    if (!challenge || !challenge.address || !challenge.amount) {
+                        console.error('[Payment Fetch] Invalid challenge data:', challenge);
+                        displayError("Payment failed: Incomplete payment details.", document.getElementById('status-message'));
+                        break;
+                    }
+
+                    // Show payment prompt to user
+                    const statusEl = document.getElementById('status-message');
+                    statusEl.innerHTML = `
+                <div class="bg-yellow-100 p-4 rounded-xl text-yellow-800 border border-yellow-300 pulse">
+                    <p class="font-bold text-lg">💳 Payment Required</p>
+                    <p class="text-sm mt-1">Amount: $${challenge.amount} USD</p>
+                    <p class="text-sm">Please confirm the transaction in your wallet...</p>
+                </div>
+            `;
+
+                    const { address, amount } = challenge;
+
+                    // where 0.00001 ETH = 10000000000000 Wei
+                    const weiBigInt = BigInt("10000000000000");
+                    const amountHex = "0x" + weiBigInt.toString(16);
+
+                    console.log('[Payment Fetch] Payment details:', {
+                        to: address,
+                        amountETH: "0.00001",
+                        amountHex: amountHex,
+                        from: account.address
+                    });
+
+                    if (typeof window.ethereum === 'undefined') {
+                        displayError("Payment failed: Wallet not found.", statusEl);
+                        return response;
+                    }
+
+                    try {
+                        console.log('[Payment Fetch] Requesting payment transaction...');
+
+                        // Request payment from wallet
+                        const txHash = await window.ethereum.request({
+                            method: 'eth_sendTransaction',
+                            params: [{
+                                from: account.address,
+                                to: address,
+                                value: amountHex,   
+                            }],
+                        });
+                        console.log(`[Payment Fetch] Payment sent! TX: ${txHash}`);
+
+                        statusEl.innerHTML = `
+                    <div class="bg-blue-100 p-4 rounded-xl text-blue-800 border border-blue-300">
+                        <p class="font-bold">⏳ Payment Confirming...</p>
+                        <p class="text-sm mt-1">TX: ${txHash.substring(0, 10)}...${txHash.substring(txHash.length - 8)}</p>
+                        <p class="text-sm">Fetching your reputation score...</p>
+                    </div>
+                `;
+
+                        // delay for transaction to be processed
+                        await new Promise(resolve => setTimeout(resolve, 2000));
+
+                        // Retry with payment proof
+                        const newHeaders = new Headers(init.headers || {});
+                        newHeaders.set('x-payment', JSON.stringify({
+                            txHash,
+                            account: account.address
+                        }));
+                        init.headers = newHeaders;
+
+                        response = await originalFetch(url, init);
+
+                        if (response.status === 200) {
+                            console.log('[Payment Fetch]  Request successful after payment');
+                            statusEl.innerHTML = `
+                        <div class="bg-green-100 p-3 rounded-xl text-green-700 border border-green-200">
+                            <p class="font-bold">Payment Confirmed!</p>
+                            <p class="text-sm">Reputation score loaded successfully.</p>
+                        </div>
+                    `;
+                            break;
+                        } else {
+                            console.log(`[Payment Fetch] Retry got status: ${response.status}`);
+                        }
+
+                    } catch (txError) {
+                        console.error("[Payment Fetch] Transaction failed:", txError);
+
+                        let errorMsg = `Payment failed: ${txError.message || 'Unknown error'}`;
+
+                        if (txError.code === 4001) {
+                            errorMsg = "Payment cancelled: You rejected the transaction in your wallet.";
+                        } else if (txError.message && txError.message.includes('insufficient funds')) {
+                            errorMsg = "Insufficient funds: You need more Base Sepolia ETH to pay for this transaction.";
+                        }
+
+                        displayError(errorMsg, statusEl);
+                        break;
+                    }
+                }
+
+                if (response.status === 402 && retryCount >= maxRetries) {
+                    displayError("Payment failed after multiple attempts. Please try again.", document.getElementById('status-message'));
+                }
+
+                return response;
+            };
+        }
+
+        const SERVER_PORT = '3001';
+        const API_URL = `http://localhost:${SERVER_PORT}/api/check-reputation`;
+        const BASE_SEPOLIA_CHAIN_ID_HEX = '0x14a34';
+        const BASE_SEPOLIA_CHAIN_ID_DEC = 84532;
+        const BASE_SEPOLIA_RPC = 'https://sepolia.base.org';
+
+        let currentAccountAddress = null;
+        let fetchWithPayment = null;
+
+        function displayError(message, targetElement) {
+            const element = targetElement || document.getElementById('results-output');
+            element.innerHTML = `
+                <div class="bg-red-100 p-4 rounded-xl text-red-700 border border-red-200">
+                    <p class="font-bold">❌ Error</p>
+                    <p class="text-sm mt-1">${message}</p>
+                </div>
+            `;
+        }
+
+        function updateUI(accountAddress, isConnected) {
+            const connectContainer = document.getElementById('connect-container');
+            const appContainer = document.getElementById('app-container');
+            const statusElement = document.getElementById('status-message');
+
+            if (isConnected) {
+                currentAccountAddress = accountAddress;
+                fetchWithPayment = wrapFetchWithPayment(fetch, { address: accountAddress });
+                connectContainer.style.display = 'none';
+                appContainer.style.display = 'block';
+                statusElement.innerHTML = `
+                    <div class="bg-green-100 p-3 rounded-xl text-green-700 text-sm font-medium border border-green-200">
+                        <span class="font-bold">  Connected:</span> ${accountAddress.substring(0, 6)}...${accountAddress.substring(accountAddress.length - 4)} 
+                        <span class="text-xs ml-2 block mt-1">Base Sepolia | 0.00001 ETH (~$0.03) per reputation check</span>
+                    </div>
+                `;
+            } else {
+                currentAccountAddress = null;
+                fetchWithPayment = null;
+                connectContainer.style.display = 'block';
+                appContainer.style.display = 'none';
+                statusElement.innerHTML = `
+                    <div class="bg-blue-100 p-3 rounded-xl text-blue-700 text-sm font-medium border border-blue-200">
+                        Connect your wallet to start verifying Solana reputations.
+                    </div>
+                `;
+            }
+        }
+
+        async function ensureCorrectChain(provider) {
+            const chainId = await provider.request({ method: 'eth_chainId' });
+            if (chainId !== BASE_SEPOLIA_CHAIN_ID_HEX) {
+                try {
+                    await provider.request({
+                        method: 'wallet_switchEthereumChain',
+                        params: [{ chainId: BASE_SEPOLIA_CHAIN_ID_HEX }],
+                    });
+                } catch (e) {
+                    if (e.code === 4902) {
+                        await provider.request({
+                            method: 'wallet_addEthereumChain',
+                            params: [{
+                                chainId: BASE_SEPOLIA_CHAIN_ID_HEX,
+                                chainName: 'Base Sepolia',
+                                rpcUrls: [BASE_SEPOLIA_RPC],
+                                nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 },
+                                blockExplorerUrls: ['https://sepolia.basescan.org']
+                            }],
+                        });
+                        throw new Error("Base Sepolia added. Please confirm the switch and click Connect again.");
+                    }
+                    throw e;
+                }
+            }
+            return true;
+        }
+
+        function handleAccountsChanged(newAccounts) {
+            if (newAccounts.length > 0) {
+                updateUI(newAccounts[0], true);
+            } else {
+                disconnectWallet();
+            }
+        }
+
+        function handleChainChanged(chainId) {
+            if (parseInt(chainId, 16) !== BASE_SEPOLIA_CHAIN_ID_DEC) {
+                displayError("Wrong network! Please switch to Base Sepolia.", document.getElementById('status-message'));
+            } else {
+                updateUI(currentAccountAddress, true);
+            }
+        }
+
+        function disconnectWallet() {
+            // Set a flag that the user explicitly disconnected
+            localStorage.setItem('isDisconnected', 'true');
+
+            if (window.ethereum && window.ethereum.removeListener) {
+                window.ethereum.removeListener('accountsChanged', handleAccountsChanged);
+                window.ethereum.removeListener('chainChanged', handleChainChanged);
+            }
+            updateUI(null, false);
+        }
+
+        async function connectWallet() {
+            localStorage.removeItem('isDisconnected');
+            try {
+                if (typeof window.ethereum === 'undefined') {
+                    displayError("MetaMask or compatible wallet not found. Please install a Web3 wallet.", document.getElementById('status-message'));
+                    return;
+                }
+
+                const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
+                const selectedAddress = accounts[0];
+
+                await ensureCorrectChain(window.ethereum);
+
+                // Authorization signature
+                const message = `Authorize Daydreams Reputation Checker\nWallet: ${selectedAddress}\nTimestamp: ${Date.now()}`;
+                try {
+                    await window.ethereum.request({
+                        method: 'personal_sign',
+                        params: [message, selectedAddress],
+                    });
+                } catch (signError) {
+                    displayError(`Authorization rejected. Please approve the signature to continue.`, document.getElementById('status-message'));
+                    disconnectWallet();
+                    return;
+                }
+
+                updateUI(selectedAddress, true);
+                window.ethereum.on('accountsChanged', handleAccountsChanged);
+                window.ethereum.on('chainChanged', handleChainChanged);
+
+            } catch (e) {
+                console.error("Connection failed:", e);
+                displayError(`Connection failed: ${e.message}`, document.getElementById('status-message'));
+                updateUI(null, false);
+            }
+        }
+
+        async function checkInitialConnection() {
+            // 1. If user explicitly disconnected, show the "Connect" UI and stop.
+            if (localStorage.getItem('isDisconnected') === 'true') {
+                console.log("User explicitly disconnected. Skipping auto-connect.");
+                updateUI(null, false); // <--- THIS WAS MISSING!
+                return;
+            }
+
+            // 2. Otherwise, check if we can auto-connect
+            if (typeof window.ethereum !== 'undefined') {
+                try {
+                    const accounts = await window.ethereum.request({ method: 'eth_accounts' });
+                    if (accounts.length > 0) {
+                        // Wallet found? Connect automatically.
+                        await ensureCorrectChain(window.ethereum);
+                        updateUI(accounts[0], true);
+                        window.ethereum.on('accountsChanged', handleAccountsChanged);
+                        window.ethereum.on('chainChanged', handleChainChanged);
+                    } else {
+                        // No accounts accessible? Show "Connect" UI
+                        updateUI(null, false);
+                    }
+                } catch (e) {
+                    console.warn("Initial connection check failed:", e);
+                    updateUI(null, false);
+                }
+            } else {
+                // MetaMask not installed -> Show "Connect" UI
+                updateUI(null, false);
+            }
+        }
+
+        async function checkReputation(solanaAddress, buttonElement, resultsDiv) {
+            if (!fetchWithPayment || !currentAccountAddress) {
+                displayError("Please connect your wallet first.", resultsDiv);
+                return;
+            }
+
+            if (!solanaAddress || solanaAddress.length < 32) {
+                displayError("Please enter a valid Solana wallet address.", resultsDiv);
+                return;
+            }
+
+            buttonElement.disabled = true;
+            buttonElement.textContent = '⏳ Processing...';
+            resultsDiv.innerHTML = `
+                <div class="bg-blue-100 p-4 rounded-xl text-blue-700 border border-blue-200">
+                    <p class="font-bold">🔍 Initiating Reputation Check</p>
+                    <p class="text-sm mt-2">You will be prompted to pay $0.01 for this check...</p>
+                </div>
+            `;
+
+            try {
+                console.log('[UI] Starting reputation check for:', solanaAddress);
+
+                const response = await fetchWithPayment(API_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ walletAddress: solanaAddress }),
+                });
+
+                console.log('[UI] Response status:', response.status);
+
+                if (!response.ok) {
+                    if (response.status === 402) {
+                        displayError(`Payment required but not completed. Please approve the $0.01 transaction in your wallet.`, resultsDiv);
+                    } else {
+                        const errorData = await response.json().catch(() => ({ error: response.statusText }));
+                        displayError(`API Error ${response.status}: ${errorData.error || "Unknown error"}`, resultsDiv);
+                    }
+                    return;
+                }
+
+                const data = await response.json();
+                console.log('[UI] Reputation data:', data);
+
+                if (data.success) {
+                    let metricsHtml = '';
+                    for (const [key, value] of Object.entries(data.metrics)) {
+                        const formattedKey = key.replace(/([A-Z])/g, ' $1').replace(/^./, str => str.toUpperCase());
+                        metricsHtml += `
+                            <li class="flex justify-between border-b border-gray-100 py-2 last:border-0">
+                                <span class="font-medium text-gray-600">${formattedKey}:</span> 
+                                <span class="text-gray-800 font-mono">${value}</span>
+                            </li>
+                        `;
+                    }
+
+                    let scoreColor = 'red';
+                    let bgColor = 'red-50';
+                    let borderColor = 'red-200';
+                    let textColor = 'red-700';
+
+                    if (data.score >= 80) {
+                        scoreColor = 'green'; bgColor = 'green-50'; borderColor = 'green-200'; textColor = 'green-700';
+                    } else if (data.score >= 40) {
+                        scoreColor = 'yellow'; bgColor = 'yellow-50'; borderColor = 'yellow-200'; textColor = 'yellow-700';
+                    }
+
+                    resultsDiv.innerHTML = `
+                        <div class="bg-${bgColor} p-6 rounded-xl shadow-lg border-2 border-${borderColor}">
+                            <div class="text-center mb-4">
+                                <p class="text-5xl font-black text-${textColor} mb-2">${data.score}</p>
+                                <p class="text-sm text-gray-500">out of 100</p>
+                            </div>
+                            <h3 class="text-2xl font-bold text-${textColor} mb-4 text-center">${data.reputation}</h3>
+                            <ul class="text-sm text-gray-700 space-y-1 bg-white rounded-lg p-4">
+                                ${metricsHtml}
+                            </ul>
+                            <p class="text-xs text-gray-400 text-center mt-4">
+                                Wallet: ${data.wallet.substring(0, 8)}...${data.wallet.substring(data.wallet.length - 6)}
+                            </p>
+                        </div>
+                    `;
+                } else {
+                    displayError(`Check failed: ${data.error || "Unknown error occurred"}`, resultsDiv);
+                }
+            } catch (error) {
+                console.error("[UI] Fatal error:", error);
+                displayError(`Request failed: ${error.message}`, resultsDiv);
+            } finally {
+                buttonElement.disabled = false;
+                buttonElement.textContent = 'Check Reputation ($0.01)';
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            document.getElementById('connect-wallet-button').addEventListener('click', connectWallet);
+            document.getElementById('disconnect-wallet-button').addEventListener('click', disconnectWallet);
+
+            document.getElementById('check-reputation-button').addEventListener('click', function () {
+                const solanaAddress = document.getElementById('solana-address-input').value.trim();
+                checkReputation(solanaAddress, this, document.getElementById('results-output'));
+            });
+
+            checkInitialConnection();
+        });
+    </script>
+</head>
+
+<body class="bg-gradient-to-br from-gray-50 to-gray-100 min-h-screen flex items-center justify-center p-4">
+    <div class="w-full max-w-lg bg-white p-8 rounded-3xl shadow-2xl border border-gray-200">
+        <div class="text-center mb-6">
+            <h1
+                class="text-4xl font-black text-transparent bg-clip-text bg-gradient-to-r from-blue-600 to-purple-600 mb-2">
+                Solana Reputation Verifier
+            </h1>
+            <p class="text-gray-500 text-sm">
+                Powered by Daydreams AI + x402 Micropayments
+            </p>
+        </div>
+
+        <div id="status-message" class="mb-6">
+        </div>
+
+        <div id="connect-container" class="mt-8">
+            <div class="bg-blue-50 p-4 rounded-xl mb-4 border border-blue-100">
+                <p class="text-sm text-blue-700 mb-2">
+                    <strong>How it works:</strong>
+                </p>
+                <ol class="text-xs text-blue-600 space-y-1 list-decimal list-inside">
+                    <li>Connect your wallet (Base Sepolia network)</li>
+                    <li>Enter a Solana wallet address to verify</li>
+                    <li>Pay ~$0.03 to get the reputation score</li>
+                </ol>
+            </div>
+            <button id="connect-wallet-button"
+                class="w-full bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-700 hover:to-purple-700 text-white font-bold py-4 px-6 rounded-xl transition duration-300 transform hover:scale-[1.02] shadow-lg">
+                Connect Wallet
+            </button>
+        </div>
+
+        <div id="app-container" style="display: none;">
+            <div class="flex justify-between items-center mb-4">
+                <h2 class="text-lg font-bold text-gray-700">Reputation Check</h2>
+                <button id="disconnect-wallet-button"
+                    class="text-xs bg-gray-200 hover:bg-gray-300 text-gray-700 py-2 px-3 rounded-lg transition font-medium">
+                    Disconnect
+                </button>
+            </div>
+
+            <div class="mb-4">
+                <label for="solana-address-input" class="block text-sm font-bold text-gray-700 mb-2">
+                    Solana Wallet Address
+                </label>
+                <input type="text" id="solana-address-input" placeholder="Enter Solana address..."
+                    value="EtD76A2kJXxvRSh2SGGYJcT95zEPTMnDB7ERAdBFPHtN"
+                    class="w-full px-4 py-3 border-2 border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-blue-500 text-gray-800 font-mono text-sm">
+                <p class="text-xs text-gray-500 mt-2">
+                Example: EtD76A2kJXxvRSh2SGGYJcT95zEPTMnDB7ERAdBFPHtN
+                </p>
+            </div>
+
+            <button id="check-reputation-button"
+                class="w-full bg-gradient-to-r from-blue-600 to-cyan-600 hover:from-blue-700 hover:to-cyan-700 text-white font-bold py-4 px-6 rounded-xl transition duration-300 transform hover:scale-[1.02] shadow-lg disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none">
+                Check Reputation ($0.03)
+            </button>
+
+            <div id="results-output" class="mt-6 min-h-[200px]">
+                <div class="bg-gray-50 p-8 rounded-xl text-center border-2 border-dashed border-gray-300">
+                    <p class="text-gray-400 text-sm">Results will appear here after payment</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="mt-8 text-center">
+            <p class="text-xs text-gray-400">
+                Daydreams Bounty 2025 • Base Sepolia Network
+            </p>
+        </div>
+    </div>
+</body>
+
+</html>
